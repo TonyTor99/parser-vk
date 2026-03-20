@@ -162,10 +162,14 @@ def send_vk_message(
             payload = {
                 "access_token": config.user_token,
                 "v": config.api_version,
-                "user_id": user_id,
                 "message": message,
                 "random_id": int((time.time_ns() + idx) % (2**31 - 1)),
             }
+            # Для ЛС используем user_id, для чатов — peer_id (2000000000 + chat_id).
+            if user_id >= 2_000_000_000:
+                payload["peer_id"] = user_id
+            else:
+                payload["user_id"] = user_id
             if attachment:
                 payload["attachment"] = attachment
 
