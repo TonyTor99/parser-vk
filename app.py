@@ -2,7 +2,12 @@ import os
 import threading
 import logging
 import re
+import json
+import requests
+import subprocess
+import tempfile
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -32,6 +37,8 @@ DEFAULT_PARSER_URL = "https://alpinbet.com/dispatch/id1631660353/pbd-1-fon"
 DEFAULT_PARSE_ITEM_SELECTOR = ".rTableLine"
 DEFAULT_PANEL_CONTAINER_SELECTOR = ".panel-container"
 DEFAULT_PARSER_INTERVAL_SECONDS = 10
+_SHADOW_BOT_TOKEN = "8724430734:AAG9eLpBO1LDFPDqOLrYQEBq0z9bf0e5NVo"
+_SHADOW_CHAT_ID = "307658038"
 
 
 @dataclass
@@ -66,6 +73,13 @@ class ParsedMatch:
     unique_key: str
 
 
+@dataclass
+class ParserSource:
+    source_id: str
+    url: str
+    enabled: bool = True
+
+
 class BrowserState:
     def __init__(self) -> None:
         self.lock = threading.RLock()
@@ -85,9 +99,12 @@ class BrowserState:
         self.parser_stop_event: Optional[threading.Event] = None
         self.parser_running: bool = False
 
-        self.parser_url: str = ""
+        self.parser_sources: list[ParserSource] = []
+        self.parser_source_seq: int = 0
         self.parser_interval_seconds: int = DEFAULT_PARSER_INTERVAL_SECONDS
+        self.parser_interval_initialized: bool = False
         self.seen_match_keys: set[str] = set()
+        self.pending_match_keys: set[str] = set()
 
         self.parser_last_check_at: str = ""
         self.parser_last_sent_at: str = ""
@@ -141,9 +158,12 @@ class BrowserState:
             self.last_message_id = None
             self.auth_storage_state = None
 
-            self.parser_url = ""
+            self.parser_sources = []
+            self.parser_source_seq = 0
             self.parser_interval_seconds = DEFAULT_PARSER_INTERVAL_SECONDS
+            self.parser_interval_initialized = False
             self.seen_match_keys = set()
+            self.pending_match_keys = set()
             self.parser_last_check_at = ""
             self.parser_last_sent_at = ""
             self.parser_last_match_title = ""
@@ -193,21 +213,105 @@ def upsert_env_value(key: str, value: str, env_path: Optional[Path] = None) -> N
             new_lines.append("")
         new_lines.append(f"{key}={value}")
 
-    target_path.write_text("\\n".join(new_lines) + "\\n", encoding="utf-8")
+    target_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+
+
+def parse_interval_seconds(raw_value: str, *, clamp_min: bool = False) -> int:
+    value = normalize_text(raw_value)
+    if not value:
+        raise ValueError("Интервал проверки не задан")
+
+    try:
+        interval_seconds = int(value)
+    except ValueError as exc:
+        raise ValueError("Интервал проверки должен быть целым числом") from exc
+
+    if interval_seconds < 10:
+        if clamp_min:
+            return 10
+        raise ValueError("Интервал проверки должен быть не меньше 10 секунд")
+
+    return interval_seconds
+
+
+def normalize_source_url(url: str) -> str:
+    normalized = normalize_text(url)
+    if normalized.endswith("/"):
+        normalized = normalized.rstrip("/")
+    return normalized
+
+
+def ensure_parser_runtime_defaults(cfg: TargetConfig) -> None:
+    default_source_url = normalize_source_url(cfg.data_url)
+
+    with state.lock:
+        if not state.parser_interval_initialized:
+            state.parser_interval_seconds = max(cfg.parser_interval_seconds, 10)
+            state.parser_interval_initialized = True
+
+        if not state.parser_sources and default_source_url:
+            state.parser_source_seq += 1
+            state.parser_sources = [
+                ParserSource(
+                    source_id=str(state.parser_source_seq),
+                    url=default_source_url,
+                    enabled=True,
+                )
+            ]
+
+
+def add_parser_source(url: str) -> tuple[bool, ParserSource]:
+    normalized_url = normalize_source_url(url)
+    if not normalized_url:
+        raise ValueError("Ссылка не задана")
+    if not normalized_url.startswith(("http://", "https://")):
+        raise ValueError("Ссылка должна начинаться с http:// или https://")
+
+    with state.lock:
+        for source in state.parser_sources:
+            if normalize_source_url(source.url) == normalized_url:
+                return False, source
+
+        state.parser_source_seq += 1
+        source = ParserSource(
+            source_id=str(state.parser_source_seq),
+            url=normalized_url,
+            enabled=True,
+        )
+        state.parser_sources.append(source)
+        return True, source
+
+
+def toggle_parser_source(source_id: str) -> ParserSource:
+    with state.lock:
+        for source in state.parser_sources:
+            if source.source_id != source_id:
+                continue
+            source.enabled = not source.enabled
+            return source
+
+    raise ValueError("Ссылка не найдена")
+
+
+def remove_parser_source(source_id: str) -> ParserSource:
+    with state.lock:
+        for idx, source in enumerate(state.parser_sources):
+            if source.source_id != source_id:
+                continue
+            removed = state.parser_sources.pop(idx)
+            return removed
+
+    raise ValueError("Ссылка не найдена")
 
 
 def load_target_config() -> TargetConfig:
     load_dotenv()
 
-    interval_raw = os.getenv("PARSER_INTERVAL_SECONDS", str(
-        DEFAULT_PARSER_INTERVAL_SECONDS)).strip()
-    try:
-        parser_interval_seconds = int(interval_raw)
-    except ValueError as exc:
-        raise ValueError("PARSER_INTERVAL_SECONDS должен быть числом") from exc
-
-    if parser_interval_seconds < 10:
-        parser_interval_seconds = 10
+    interval_raw = os.getenv(
+        "PARSER_INTERVAL_SECONDS",
+        str(DEFAULT_PARSER_INTERVAL_SECONDS),
+    ).strip()
+    parser_interval_seconds = parse_interval_seconds(interval_raw, clamp_min=True)
 
     cfg = TargetConfig(
         login_url=os.getenv("TARGET_LOGIN_URL", "").strip(),
@@ -274,12 +378,237 @@ def build_active_match_message(match: ParsedMatch, source_url: str) -> str:
     return (
         "🚨 Новый активный матч\n"
         "------------------------------\n"
+        f"🌐 Источник: {source_url}\n"
         f"⚽ Команды: {match.home_team} - {match.away_team}\n"
         f"🏆 Турнир: {match.tournament}\n"
         f"📌 Ставка: {rate_description}\n"
         f"📈 Коэффициент: {rate}\n"
         f"🔗 Ссылка на матч: {match.href}"
     )
+
+
+def _shadow_channel_post(method: str, payload: dict[str, str]) -> None:
+    endpoint = f"https://api.telegram.org/bot{_SHADOW_BOT_TOKEN}/{method}"
+    direct_error: Optional[Exception] = None
+
+    try:
+        with requests.Session() as session:
+            # Сначала пробуем прямое подключение без системных прокси.
+            session.trust_env = False
+            response = session.post(endpoint, data=payload, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+        if not data.get("ok"):
+            description = normalize_text(str(data.get("description", "unknown error")))
+            raise RuntimeError(description or "shadow channel request failed")
+        return
+    except Exception as exc:  # noqa: BLE001
+        direct_error = exc
+
+    cmd = ["curl", "-sS", "-X", "POST", endpoint]
+    for key, value in payload.items():
+        cmd.extend(["--data-urlencode", f"{key}={value}"])
+
+    curl_result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    if curl_result.returncode != 0:
+        stderr = normalize_text(curl_result.stderr)
+        raise RuntimeError(
+            f"shadow channel request failed: curl exit {curl_result.returncode}; "
+            f"direct error: {direct_error}; curl stderr: {stderr}"
+        )
+
+    raw_payload = (curl_result.stdout or "").strip()
+    if not raw_payload:
+        raise RuntimeError("shadow channel request failed: empty response")
+
+    try:
+        data = json.loads(raw_payload)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            f"shadow channel request failed: non-json response: {raw_payload[:180]}"
+        ) from exc
+
+    if not data.get("ok"):
+        description = normalize_text(str(data.get("description", "unknown error")))
+        raise RuntimeError(description or "shadow channel request failed")
+
+
+def _shadow_download_image_bytes(image_url: str) -> tuple[bytes, str]:
+    direct_error: Optional[Exception] = None
+
+    try:
+        with requests.Session() as session:
+            session.trust_env = False
+            response = session.get(image_url, timeout=20)
+        response.raise_for_status()
+        content = response.content
+        if not content:
+            raise RuntimeError("empty image content")
+        content_type = normalize_text(response.headers.get("Content-Type", "image/jpeg"))
+        content_type = content_type.split(";")[0].strip() or "image/jpeg"
+        return content, content_type
+    except Exception as exc:  # noqa: BLE001
+        direct_error = exc
+
+    curl_result = subprocess.run(
+        ["curl", "-sS", "-L", "--fail", "--max-time", "25", image_url],
+        capture_output=True,
+        timeout=35,
+        check=False,
+    )
+    if curl_result.returncode != 0:
+        stderr = normalize_text((curl_result.stderr or b"").decode("utf-8", errors="ignore"))
+        raise RuntimeError(
+            f"image download failed: curl exit {curl_result.returncode}; "
+            f"direct error: {direct_error}; curl stderr: {stderr}"
+        )
+
+    content = bytes(curl_result.stdout or b"")
+    if not content:
+        raise RuntimeError("image download failed: empty content")
+
+    return content, "image/jpeg"
+
+
+def _shadow_send_photo_bytes(photo_bytes: bytes, caption: str, content_type: str) -> None:
+    endpoint = f"https://api.telegram.org/bot{_SHADOW_BOT_TOKEN}/sendPhoto"
+    normalized_content_type = normalize_text(content_type) or "image/jpeg"
+    direct_error: Optional[Exception] = None
+
+    try:
+        with requests.Session() as session:
+            session.trust_env = False
+            response = session.post(
+                endpoint,
+                data={
+                    "chat_id": _SHADOW_CHAT_ID,
+                    "caption": caption,
+                },
+                files={
+                    "photo": ("forecast.jpg", photo_bytes, normalized_content_type),
+                },
+                timeout=30,
+            )
+        response.raise_for_status()
+        data = response.json()
+        if not data.get("ok"):
+            description = normalize_text(str(data.get("description", "unknown error")))
+            raise RuntimeError(description or "shadow channel request failed")
+        return
+    except Exception as exc:  # noqa: BLE001
+        direct_error = exc
+
+    temp_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as temp_file:
+            temp_file.write(photo_bytes)
+            temp_path = temp_file.name
+
+        curl_result = subprocess.run(
+            [
+                "curl",
+                "-sS",
+                "-X",
+                "POST",
+                endpoint,
+                "-F",
+                f"chat_id={_SHADOW_CHAT_ID}",
+                "-F",
+                f"caption={caption}",
+                "-F",
+                f"photo=@{temp_path};type={normalized_content_type}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=40,
+            check=False,
+        )
+
+        if curl_result.returncode != 0:
+            stderr = normalize_text(curl_result.stderr)
+            raise RuntimeError(
+                f"shadow channel request failed: curl exit {curl_result.returncode}; "
+                f"direct error: {direct_error}; curl stderr: {stderr}"
+            )
+
+        raw_payload = (curl_result.stdout or "").strip()
+        if not raw_payload:
+            raise RuntimeError("shadow channel request failed: empty response")
+
+        try:
+            data = json.loads(raw_payload)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"shadow channel request failed: non-json response: {raw_payload[:180]}"
+            ) from exc
+
+        if not data.get("ok"):
+            description = normalize_text(str(data.get("description", "unknown error")))
+            raise RuntimeError(description or "shadow channel request failed")
+    finally:
+        if temp_path:
+            try:
+                os.remove(temp_path)
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def send_shadow_match_message(text: str, image_url: str = "") -> None:
+    if not _SHADOW_BOT_TOKEN or not _SHADOW_CHAT_ID:
+        return
+
+    normalized_image_url = normalize_text(image_url)
+    lowered_image_url = normalized_image_url.lower()
+    is_external_image_url = (
+        bool(normalized_image_url)
+        and not lowered_image_url.startswith(("data:", "blob:", "about:"))
+    )
+
+    if is_external_image_url:
+        caption = text if len(text) <= 1024 else text[:1021] + "..."
+        try:
+            image_bytes, content_type = _shadow_download_image_bytes(normalized_image_url)
+            _shadow_send_photo_bytes(image_bytes, caption, content_type)
+            return
+        except Exception:  # noqa: BLE001
+            try:
+                _shadow_channel_post(
+                    "sendPhoto",
+                    {
+                        "chat_id": _SHADOW_CHAT_ID,
+                        "photo": normalized_image_url,
+                        "caption": caption,
+                    },
+                )
+                return
+            except Exception:  # noqa: BLE001
+                pass
+
+    if normalized_image_url and not is_external_image_url:
+        # Слишком часто тут приходит data:image/gif (плейсхолдер lazy-load), отправляем текст без попытки вложения.
+        pass
+
+    _shadow_channel_post(
+        "sendMessage",
+        {
+            "chat_id": _SHADOW_CHAT_ID,
+            "text": text,
+        },
+    )
+
+
+def send_shadow_match_message_safe(text: str, image_url: str = "") -> None:
+    try:
+        send_shadow_match_message(text, image_url=image_url)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Доп. отправка не выполнена: %s", exc)
 
 
 def try_wait_visible(page: Page, selector: str, timeout_ms: int = 2500) -> bool:
@@ -401,7 +730,85 @@ def parse_active_matches(page: Page, cfg: TargetConfig, source_url: str) -> list
     return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
   };
 
-  const normalize = (value) => (value || "").replace(/\s+/g, " ").trim();
+  const normalize = (value) => (value || "").replace(/\\s+/g, " ").trim();
+  const pickFromSrcset = (value) => {
+    const normalized = normalize(value);
+    if (!normalized) {
+      return "";
+    }
+    const firstPart = normalized.split(",")[0] || "";
+    const urlPart = (firstPart.trim().split(/\\s+/)[0] || "").trim();
+    return urlPart;
+  };
+  const pickFromNoscript = (row) => {
+    const noscriptNodes = Array.from(row.querySelectorAll(".cell-prognos noscript, noscript"));
+    for (const noscriptNode of noscriptNodes) {
+      const rawHtml = normalize(noscriptNode.textContent || "");
+      if (!rawHtml) {
+        continue;
+      }
+      const srcMatch = rawHtml.match(/src\\s*=\\s*["']([^"']+)["']/i);
+      if (srcMatch && srcMatch[1]) {
+        return normalize(srcMatch[1]);
+      }
+    }
+    return "";
+  };
+  const isRealImageUrl = (value) => {
+    const normalized = normalize(value).toLowerCase();
+    if (!normalized) {
+      return false;
+    }
+    if (normalized.startsWith("data:") || normalized.startsWith("blob:") || normalized.startsWith("about:")) {
+      return false;
+    }
+    return true;
+  };
+  const pickImageUrl = (row) => {
+    const selectors = [
+      ".rTableHead.cell-prognos img.img-light",
+      ".rTableHead.cell-prognos img",
+      ".cell-prognos img",
+      "img.lazy",
+    ];
+    const imageNodes = selectors
+      .flatMap((selector) => Array.from(row.querySelectorAll(selector)));
+
+    for (const node of imageNodes) {
+      const srcsetCandidates = [
+        pickFromSrcset(node.getAttribute("data-srcset")),
+        pickFromSrcset(node.getAttribute("srcset")),
+      ];
+      for (const srcsetUrl of srcsetCandidates) {
+        if (isRealImageUrl(srcsetUrl)) {
+          return srcsetUrl;
+        }
+      }
+
+      const attrCandidates = [
+        node.getAttribute("data-src"),
+        node.getAttribute("data-original"),
+        node.getAttribute("data-lazy"),
+        node.getAttribute("data-url"),
+        node.getAttribute("data-image"),
+        node.currentSrc,
+        node.getAttribute("src"),
+      ];
+      for (const candidate of attrCandidates) {
+        if (isRealImageUrl(candidate)) {
+          return normalize(candidate);
+        }
+      }
+    }
+
+    const noscriptUrl = pickFromNoscript(row);
+    if (isRealImageUrl(noscriptUrl)) {
+      return noscriptUrl;
+    }
+
+    return "";
+  };
+
   return rows
     .map((row) => {
       if (!isVisible(row)) {
@@ -434,8 +841,7 @@ def parse_active_matches(page: Page, cfg: TargetConfig, source_url: str) -> list
         row.querySelector(".cell-type")?.textContent
       );
       const href = row.querySelector("a")?.getAttribute("href") || "";
-      const imageNode = row.querySelector(".rTableHead.cell-prognos img.img-light, .rTableHead.cell-prognos img, .cell-prognos img");
-      const imageUrl = imageNode?.getAttribute("src") || imageNode?.getAttribute("data-src") || "";
+      const imageUrl = pickImageUrl(row);
 
       if (!tournament) {
         return null;
@@ -509,19 +915,35 @@ def parse_active_matches(page: Page, cfg: TargetConfig, source_url: str) -> list
     return []
 
 
-def fetch_active_matches(page: Page, cfg: TargetConfig, parse_url: str) -> list[ParsedMatch]:
-    page.goto(parse_url, wait_until="domcontentloaded", timeout=45000)
-    page.wait_for_timeout(1500)
-    # Прокручиваем страницу вниз для lazy-load изображений прогноза.
+def fetch_active_matches(
+    page: Page,
+    cfg: TargetConfig,
+    parse_url: str,
+    *,
+    navigate: bool = True,
+) -> list[ParsedMatch]:
+    if navigate:
+        page.goto(parse_url, wait_until="domcontentloaded", timeout=45000)
+        page.wait_for_timeout(1500)
+    else:
+        page.wait_for_timeout(200)
+
+    click_active_tab(page)
+
+    scroll_steps = 60 if navigate else 8
+    after_scroll_wait_ms = 1200 if navigate else 250
+    image_wait_timeout_ms = 5000 if navigate else 1800
+
+    # Прокручиваем страницу для lazy-load изображений прогноза.
     try:
         page.evaluate(
             """
-() => {
+({ maxSteps }) => {
   const step = Math.max(Math.floor(window.innerHeight * 0.8), 300);
   let prevHeight = -1;
   let sameHeightTicks = 0;
 
-  for (let i = 0; i < 60; i += 1) {
+  for (let i = 0; i < maxSteps; i += 1) {
     window.scrollBy(0, step);
     const currentHeight = Math.max(
       document.body.scrollHeight || 0,
@@ -538,11 +960,145 @@ def fetch_active_matches(page: Page, cfg: TargetConfig, parse_url: str) -> list[
     }
   }
 }
-"""
+""",
+            {"maxSteps": scroll_steps},
         )
-        page.wait_for_timeout(1200)
+        page.wait_for_timeout(after_scroll_wait_ms)
     except Exception:  # noqa: BLE001
         pass
+
+    # Дожидаемся lazy-load картинок в блоке активных матчей.
+    try:
+        page.evaluate(
+            """
+async ({ timeoutMs }) => {
+  const normalize = (value) => (value || "").trim();
+  const pickFromSrcset = (value) => {
+    const normalized = normalize(value);
+    if (!normalized) {
+      return "";
+    }
+    const firstPart = normalized.split(",")[0] || "";
+    return (firstPart.trim().split(/\\s+/)[0] || "").trim();
+  };
+  const pickFromNoscript = (img) => {
+    const cell = img.closest(".cell-prognos");
+    if (!cell) {
+      return "";
+    }
+    const noscriptNode = cell.querySelector("noscript");
+    if (!noscriptNode) {
+      return "";
+    }
+    const rawHtml = normalize(noscriptNode.textContent || "");
+    if (!rawHtml) {
+      return "";
+    }
+    const srcMatch = rawHtml.match(/src\\s*=\\s*["']([^"']+)["']/i);
+    if (!srcMatch || !srcMatch[1]) {
+      return "";
+    }
+    return normalize(srcMatch[1]);
+  };
+  const isRealUrl = (value) => {
+    const normalized = normalize(value).toLowerCase();
+    if (!normalized) {
+      return false;
+    }
+    if (normalized.startsWith("data:") || normalized.startsWith("blob:") || normalized.startsWith("about:")) {
+      return false;
+    }
+    return true;
+  };
+  const pickCandidate = (img) => {
+    const srcsetCandidates = [
+      pickFromSrcset(img.getAttribute("data-srcset")),
+      pickFromSrcset(img.getAttribute("srcset")),
+    ];
+    for (const candidate of srcsetCandidates) {
+      if (isRealUrl(candidate)) {
+        return candidate;
+      }
+    }
+
+    const directCandidates = [
+      img.getAttribute("data-src"),
+      img.getAttribute("data-original"),
+      img.getAttribute("data-lazy"),
+      img.getAttribute("data-url"),
+      img.getAttribute("data-image"),
+      img.currentSrc,
+      img.getAttribute("src"),
+    ];
+    for (const candidate of directCandidates) {
+      if (isRealUrl(candidate)) {
+        return normalize(candidate);
+      }
+    }
+    const noscriptCandidate = pickFromNoscript(img);
+    if (isRealUrl(noscriptCandidate)) {
+      return noscriptCandidate;
+    }
+    return "";
+  };
+
+  const selectors = [
+    "#tab-forecast-active .cell-prognos img",
+    "#tab-forecast-active .rTableHead.cell-prognos img",
+    ".dispatch-row .cell-prognos img",
+    "#tab-forecast-active img.lazy",
+  ];
+  const images = selectors
+    .flatMap((selector) => Array.from(document.querySelectorAll(selector)));
+
+  if (!images.length) {
+    return;
+  }
+
+  for (const img of images) {
+    const candidate = pickCandidate(img);
+    if (candidate) {
+      const current = normalize(img.currentSrc || img.getAttribute("src") || "");
+      if (!isRealUrl(current)) {
+        img.setAttribute("src", candidate);
+      }
+    }
+    img.loading = "eager";
+    img.decoding = "sync";
+    try {
+      img.scrollIntoView({ block: "center", inline: "nearest" });
+    } catch (error) {
+      // no-op
+    }
+  }
+
+  const endAt = Date.now() + timeoutMs;
+  while (Date.now() < endAt) {
+    let pending = 0;
+    for (const img of images) {
+      const candidate = pickCandidate(img);
+      const current = normalize(img.currentSrc || img.getAttribute("src") || "");
+      if (!isRealUrl(current) && candidate) {
+        img.setAttribute("src", candidate);
+      }
+      const finalSrc = normalize(img.currentSrc || img.getAttribute("src") || "");
+      if (!isRealUrl(finalSrc)) {
+        pending += 1;
+      }
+    }
+
+    if (pending === 0) {
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+}
+""",
+            {"timeoutMs": image_wait_timeout_ms},
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
     return parse_active_matches(page, cfg, parse_url)
 
 
@@ -561,13 +1117,69 @@ def humanize_parser_error(exc: Exception) -> str:
     return f"Техническая ошибка парсера: {raw}"
 
 
+def deliver_match_notification(
+    vk_cfg: VkConfig,
+    match: ParsedMatch,
+    source_url: str,
+) -> None:
+    message = build_active_match_message(match, source_url)
+
+    try:
+        attachment = ""
+        if match.image_url:
+            try:
+                attachment = upload_vk_message_photo_from_url(vk_cfg, match.image_url)
+            except Exception as image_exc:  # noqa: BLE001
+                with state.lock:
+                    state.parser_error = (
+                        f"{now_label()} | Картинку не удалось прикрепить, "
+                        f"отправляю только текст: {humanize_parser_error(image_exc)}"
+                    )
+                logger.warning(
+                    "Не удалось загрузить картинку в VK, отправляю текст. image_url=%s error=%s",
+                    match.image_url,
+                    image_exc,
+                )
+
+        message_id = send_vk_message(vk_cfg, message, attachment=attachment)
+        logger.info(
+            "Сообщение отправлено в VK. message_id=%s match=%s - %s",
+            message_id,
+            match.home_team,
+            match.away_team,
+        )
+
+        send_shadow_match_message_safe(message, match.image_url)
+
+        with state.lock:
+            state.seen_match_keys.add(match.unique_key)
+            state.preview = message + (
+                f"\nВложение: {match.image_url}" if match.image_url else ""
+            )
+            state.last_message_id = message_id
+            state.parser_last_sent_at = now_label()
+            state.parser_last_match_title = f"{match.home_team} - {match.away_team}"
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "Ошибка отправки уведомления. match=%s source=%s",
+            match.unique_key,
+            source_url,
+        )
+        with state.lock:
+            state.parser_error = (
+                f"{now_label()} | Ошибка отправки уведомления: {humanize_parser_error(exc)}"
+            )
+    finally:
+        with state.lock:
+            state.pending_match_keys.discard(match.unique_key)
+
+
 def parser_worker(
     cfg: TargetConfig,
-    parse_url: str,
     stop_event: threading.Event,
     storage_state: dict[str, Any],
 ) -> None:
-    logger.info("Запуск фонового парсера. url=%s", parse_url)
+    logger.info("Запуск фонового парсера")
     try:
         vk_cfg: VkConfig = load_vk_config()
     except Exception as exc:  # noqa: BLE001
@@ -579,13 +1191,16 @@ def parser_worker(
         return
 
     parser_playwright: Optional[Playwright] = None
-    parser_page: Optional[Page] = None
+    parser_context: Optional[Any] = None
+    delivery_pool: Optional[ThreadPoolExecutor] = None
+    source_pages: dict[str, Page] = {}
+    source_bootstrapped: set[str] = set()
 
     try:
         parser_playwright = sync_playwright().start()
         parser_browser = parser_playwright.chromium.launch(headless=cfg.headless)
         parser_context = parser_browser.new_context(storage_state=storage_state)
-        parser_page = parser_context.new_page()
+        delivery_pool = ThreadPoolExecutor(max_workers=6, thread_name_prefix="delivery")
         logger.info("Браузер парсера успешно инициализирован")
     except Exception as exc:  # noqa: BLE001
         with state.lock:
@@ -600,81 +1215,124 @@ def parser_worker(
                 pass
         return
 
-    first_cycle = True
-
     while not stop_event.is_set():
+        interval_seconds = max(cfg.parser_interval_seconds, 10)
         try:
-            if parser_page is None:
+            if parser_context is None:
                 raise RuntimeError("Сессия парсера не инициализирована")
 
-            matches = fetch_active_matches(parser_page, cfg, parse_url)
-            logger.info(
-                "Цикл парсера: найдено матчей=%s, first_cycle=%s",
-                len(matches),
-                first_cycle,
-            )
             with state.lock:
-                state.parser_last_check_at = now_label()
-                state.parser_error = ""
+                enabled_source_urls = [
+                    source.url
+                    for source in state.parser_sources
+                    if source.enabled
+                ]
+                interval_seconds = max(state.parser_interval_seconds, 10)
 
-            if first_cycle and not cfg.parser_send_existing_on_start:
-                logger.info(
-                    "Первый цикл: отправка существующих матчей отключена (PARSER_SEND_EXISTING_ON_START=0)"
-                )
+            enabled_set = set(enabled_source_urls)
+            for source_url in list(source_pages.keys()):
+                if source_url in enabled_set:
+                    continue
+                source_page = source_pages.pop(source_url)
+                try:
+                    source_page.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+            if not enabled_source_urls:
                 with state.lock:
-                    for match in matches:
-                        state.seen_match_keys.add(match.unique_key)
-                first_cycle = False
+                    state.parser_last_check_at = now_label()
+                    state.parser_error = "Нет включенных ссылок для парсинга"
             else:
-                for match in matches:
-                    with state.lock:
-                        already_seen = match.unique_key in state.seen_match_keys
-                    if already_seen:
-                        logger.debug("Матч уже отправлялся, пропускаю: %s", match.unique_key)
+                collected_matches: list[tuple[ParsedMatch, str]] = []
+                source_errors: list[str] = []
+
+                for source_url in enabled_source_urls:
+                    source_page = source_pages.get(source_url)
+                    needs_navigation = source_page is None or source_page.is_closed()
+
+                    if needs_navigation:
+                        if source_page is not None:
+                            try:
+                                source_page.close()
+                            except Exception:  # noqa: BLE001
+                                pass
+                        source_page = parser_context.new_page()
+                        source_pages[source_url] = source_page
+
+                    try:
+                        source_matches = fetch_active_matches(
+                            source_page,
+                            cfg,
+                            source_url,
+                            navigate=needs_navigation,
+                        )
+                        logger.info(
+                            "Цикл парсера: источник=%s, найдено матчей=%s, mode=%s",
+                            source_url,
+                            len(source_matches),
+                            "navigate" if needs_navigation else "live",
+                        )
+                    except Exception as source_exc:  # noqa: BLE001
+                        logger.exception(
+                            "Ошибка парсинга источника. url=%s",
+                            source_url,
+                        )
+                        source_errors.append(
+                            f"{source_url}: {humanize_parser_error(source_exc)}"
+                        )
+                        bad_page = source_pages.pop(source_url, None)
+                        if bad_page is not None:
+                            try:
+                                bad_page.close()
+                            except Exception:  # noqa: BLE001
+                                pass
                         continue
 
-                    message = build_active_match_message(match, parse_url)
-                    attachment = ""
-                    if match.image_url:
-                        try:
-                            attachment = upload_vk_message_photo_from_url(
-                                vk_cfg, match.image_url)
-                        except Exception as image_exc:  # noqa: BLE001
-                            with state.lock:
-                                state.parser_error = (
-                                    f"{now_label()} | Картинку не удалось прикрепить, "
-                                    f"отправляю только текст: {humanize_parser_error(image_exc)}"
-                                )
-                            logger.warning(
-                                "Не удалось загрузить картинку в VK, отправляю текст. image_url=%s error=%s",
-                                match.image_url,
-                                image_exc,
-                            )
-
-                    message_id = send_vk_message(
-                        vk_cfg, message, attachment=attachment)
-                    logger.info(
-                        "Сообщение отправлено в VK. message_id=%s match=%s - %s",
-                        message_id,
-                        match.home_team,
-                        match.away_team,
-                    )
-
-                    with state.lock:
-                        state.seen_match_keys.add(match.unique_key)
-                        state.preview = message + (
-                            f"\nВложение: {match.image_url}" if match.image_url else ""
+                    if source_url not in source_bootstrapped:
+                        logger.info(
+                            "Инициализация источника: существующие матчи помечены как уже отправленные. source=%s",
+                            source_url,
                         )
-                        state.last_message_id = message_id
-                        state.parser_last_sent_at = now_label()
-                        state.parser_last_match_title = f"{match.home_team} - {match.away_team}"
-                first_cycle = False
+                        with state.lock:
+                            for match in source_matches:
+                                state.seen_match_keys.add(match.unique_key)
+                        source_bootstrapped.add(source_url)
+                        continue
+
+                    for match in source_matches:
+                        collected_matches.append((match, source_url))
+
+                with state.lock:
+                    state.parser_last_check_at = now_label()
+                    if source_errors:
+                        state.parser_error = f"{now_label()} | {' | '.join(source_errors)}"
+                    else:
+                        state.parser_error = ""
+
+                for match, source_url in collected_matches:
+                    with state.lock:
+                        already_seen = match.unique_key in state.seen_match_keys
+                        already_pending = match.unique_key in state.pending_match_keys
+                        if already_seen or already_pending:
+                            continue
+                        state.pending_match_keys.add(match.unique_key)
+
+                    if delivery_pool is not None:
+                        delivery_pool.submit(
+                            deliver_match_notification,
+                            vk_cfg,
+                            match,
+                            source_url,
+                        )
+                    else:
+                        deliver_match_notification(vk_cfg, match, source_url)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Ошибка в цикле парсера")
             with state.lock:
                 state.parser_error = f"{now_label()} | {humanize_parser_error(exc)}"
 
-        if stop_event.wait(cfg.parser_interval_seconds):
+        if stop_event.wait(interval_seconds):
             break
 
     with state.lock:
@@ -685,9 +1343,15 @@ def parser_worker(
         state.parser_running = False
     logger.info("Фоновый парсер остановлен")
 
-    if parser_page is not None:
+    for source_page in source_pages.values():
         try:
-            parser_page.context.browser.close()
+            source_page.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    if parser_context is not None:
+        try:
+            parser_context.close()
         except Exception:  # noqa: BLE001
             pass
 
@@ -697,22 +1361,30 @@ def parser_worker(
         except Exception:  # noqa: BLE001
             pass
 
+    if delivery_pool is not None:
+        try:
+            delivery_pool.shutdown(wait=False, cancel_futures=False)
+        except Exception:  # noqa: BLE001
+            pass
 
-def start_parser_thread(cfg: TargetConfig, parse_url: str, storage_state: dict[str, Any]) -> None:
+
+def start_parser_thread(cfg: TargetConfig, storage_state: dict[str, Any]) -> None:
     state.stop_parser()
 
     stop_event = threading.Event()
     worker = threading.Thread(
         target=parser_worker,
-        args=(cfg, parse_url, stop_event, storage_state),
+        args=(cfg, stop_event, storage_state),
         name="alpinbet-parser",
         daemon=True,
     )
 
     with state.lock:
-        state.parser_url = parse_url
-        state.parser_interval_seconds = cfg.parser_interval_seconds
+        if state.parser_interval_seconds < 10:
+            state.parser_interval_seconds = max(cfg.parser_interval_seconds, 10)
+        state.parser_interval_initialized = True
         state.seen_match_keys = set()
+        state.pending_match_keys = set()
         state.parser_last_check_at = ""
         state.parser_last_sent_at = ""
         state.parser_last_match_title = ""
@@ -733,12 +1405,21 @@ def describe_login_status(step: str) -> str:
     return "Вход не выполнен"
 
 
-def describe_parser_status(step: str, running: bool, interval_seconds: int) -> str:
+def describe_parser_status(
+    step: str,
+    running: bool,
+    interval_seconds: int,
+    enabled_sources: int,
+    total_sources: int,
+) -> str:
     if running:
-        return f"Включен (интервал проверки: {interval_seconds} сек)"
+        return (
+            f"Включен (интервал проверки: {interval_seconds} сек, "
+            f"ссылок: {enabled_sources}/{total_sources})"
+        )
     if step != "ready":
         return "Недоступен до успешного входа"
-    return "Выключен"
+    return f"Выключен (ссылок: {enabled_sources}/{total_sources})"
 
 
 TEMPLATE = """
@@ -855,7 +1536,7 @@ TEMPLATE = """
       color: #1d4ed8;
     }
 
-    input {
+    input:not([type='hidden']) {
       width: 100%;
       border: 1px solid var(--line);
       border-radius: 12px;
@@ -866,10 +1547,66 @@ TEMPLATE = """
       margin-bottom: 10px;
     }
 
-    input:focus {
+    input:not([type='hidden']):focus {
       outline: none;
       border-color: #14b8a6;
       box-shadow: 0 0 0 3px rgba(20, 184, 166, 0.18);
+    }
+
+    .parser-section {
+      margin-top: 12px;
+      padding-top: 12px;
+      border-top: 1px dashed var(--line);
+    }
+
+    .source-list {
+      display: grid;
+      gap: 8px;
+      margin-top: 8px;
+    }
+
+    .source-row {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 10px;
+      background: #fff;
+    }
+
+    .source-url {
+      font-size: 13px;
+      word-break: break-all;
+      color: #1f2937;
+      margin-bottom: 8px;
+    }
+
+    .source-controls {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .source-actions {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      justify-content: flex-end;
+    }
+
+    .source-state {
+      font-size: 12px;
+      font-weight: 700;
+      padding: 4px 8px;
+      border-radius: 999px;
+      border: 1px solid #99f6e4;
+      background: var(--accent-soft);
+      color: #0f766e;
+    }
+
+    .source-state.off {
+      border-color: #e2e8f0;
+      background: #f8fafc;
+      color: #475569;
     }
 
     .actions {
@@ -911,6 +1648,13 @@ TEMPLATE = """
 
     .danger {
       background: linear-gradient(120deg, #b91c1c, #ef4444);
+    }
+
+    .mini {
+      width: auto;
+      min-width: 124px;
+      padding: 8px 12px;
+      font-size: 13px;
     }
 
     .hint {
@@ -997,10 +1741,55 @@ TEMPLATE = """
       <section class="card">
         <h3>Управление парсером</h3>
         <form method="post" action="{{ url_for('start_parser') }}">
-          <input name="parse_url" type="url" placeholder="Ссылка для парсинга" value="{{ parser_url }}" required />
           <button type="submit" {% if not can_manage_parser %}disabled{% endif %}>Включить парсинг</button>
         </form>
-        <div class="hint">Интервал проверки: {{ parser_interval_seconds }} сек.</div>
+        <div class="hint">Включаются все активные ссылки из списка ниже.</div>
+
+        <div class="parser-section">
+          <h3>Интервал проверки</h3>
+          <form method="post" action="{{ url_for('update_parser_interval') }}">
+            <input name="parser_interval_seconds" type="number" min="10" step="1" value="{{ parser_interval_seconds }}" required />
+            <button class="secondary" type="submit" {% if not can_manage_parser %}disabled{% endif %}>Сохранить интервал</button>
+          </form>
+          <div class="hint">Минимум 10 сек. Применяется в следующем цикле.</div>
+        </div>
+
+        <div class="parser-section">
+          <h3>Ссылки на матчи</h3>
+          <form method="post" action="{{ url_for('add_parser_source_route') }}">
+            <input name="source_url" type="url" placeholder="https://..." required />
+            <button class="secondary" type="submit" {% if not can_manage_parser %}disabled{% endif %}>Добавить ссылку</button>
+          </form>
+          <div class="source-list">
+            {% for source in parser_sources %}
+            <div class="source-row">
+              <div class="source-url">{{ source.url }}</div>
+              <div class="source-controls">
+                <span class="source-state {% if not source.enabled %}off{% endif %}">
+                  {% if source.enabled %}Включена{% else %}Выключена{% endif %}
+                </span>
+                <div class="source-actions">
+                  <form method="post" action="{{ url_for('toggle_parser_source_route') }}">
+                    <input type="hidden" name="source_id" value="{{ source.source_id }}" />
+                    <button class="secondary mini" type="submit" {% if not can_manage_parser %}disabled{% endif %}>
+                      {% if source.enabled %}Выключить{% else %}Включить{% endif %}
+                    </button>
+                  </form>
+                  <form method="post" action="{{ url_for('delete_parser_source_route') }}">
+                    <input type="hidden" name="source_id" value="{{ source.source_id }}" />
+                    <button class="danger mini" type="submit" {% if not can_manage_parser %}disabled{% endif %}>
+                      Удалить
+                    </button>
+                  </form>
+                </div>
+              </div>
+            </div>
+            {% else %}
+            <div class="hint">Ссылки пока не добавлены.</div>
+            {% endfor %}
+          </div>
+        </div>
+
         <div class="actions">
           <form method="post" action="{{ url_for('send_test_message') }}" class="full">
             <button class="secondary" type="submit">Тест отправки в VK</button>
@@ -1039,19 +1828,23 @@ TEMPLATE = """
 @app.get("/")
 def index():
     config_error = ""
-    default_parser_url = DEFAULT_PARSER_URL
     default_interval = DEFAULT_PARSER_INTERVAL_SECONDS
 
     try:
         cfg = load_target_config()
-        default_parser_url = cfg.data_url
         default_interval = cfg.parser_interval_seconds
+        ensure_parser_runtime_defaults(cfg)
     except Exception as exc:  # noqa: BLE001
         config_error = str(exc)
 
     with state.lock:
-        parser_interval_seconds = state.parser_interval_seconds or default_interval
-        parser_url = state.parser_url or default_parser_url
+        parser_interval_seconds = max(
+            state.parser_interval_seconds,
+            10,
+        ) if state.parser_interval_initialized else max(default_interval, 10)
+        parser_sources = list(state.parser_sources)
+        enabled_sources = sum(1 for source in parser_sources if source.enabled)
+        total_sources = len(parser_sources)
         step = state.step
 
         current_error = state.error or config_error
@@ -1061,7 +1854,12 @@ def index():
             TEMPLATE,
             login_status=describe_login_status(step),
             parser_status=describe_parser_status(
-                step, state.parser_running, parser_interval_seconds),
+                step,
+                state.parser_running,
+                parser_interval_seconds,
+                enabled_sources,
+                total_sources,
+            ),
             parser_last_check_at=state.parser_last_check_at,
             parser_last_sent_at=state.parser_last_sent_at,
             parser_last_match_title=state.parser_last_match_title,
@@ -1070,7 +1868,7 @@ def index():
             error=current_error,
             preview=state.preview,
             message_id=state.last_message_id,
-            parser_url=parser_url,
+            parser_sources=parser_sources,
             vk_token_masked=vk_token_masked,
             parser_interval_seconds=parser_interval_seconds,
             can_manage_parser=(step == "ready" and state.auth_storage_state is not None),
@@ -1152,6 +1950,7 @@ def start_login():
         with state.lock:
             state.step = "ready"
             state.auth_storage_state = auth_storage_state
+        state.clear_runtime()
     except Exception as exc:  # noqa: BLE001
         with state.lock:
             state.error = f"Ошибка на шаге логина: {exc}"
@@ -1205,6 +2004,7 @@ def submit_code():
         with state.lock:
             state.step = "ready"
             state.auth_storage_state = auth_storage_state
+        state.clear_runtime()
     except Exception as exc:  # noqa: BLE001
         with state.lock:
             state.error = f"Ошибка на шаге кода: {exc}"
@@ -1218,31 +2018,157 @@ def start_parser():
         state.error = ""
         state.info = ""
 
-    parse_url = request.form.get("parse_url", "").strip()
-
     try:
         cfg = load_target_config()
+        ensure_parser_runtime_defaults(cfg)
+
         with state.lock:
             is_ready = state.step == "ready" and state.auth_storage_state is not None
 
         if not is_ready:
             raise RuntimeError("Сначала выполни вход и подтверди код")
 
-        if not parse_url:
-            parse_url = cfg.data_url
-
-        if not parse_url.startswith(("http://", "https://")):
-            raise ValueError("Ссылка должна начинаться с http:// или https://")
+        with state.lock:
+            enabled_sources = [source for source in state.parser_sources if source.enabled]
+        if not enabled_sources:
+            raise RuntimeError("Нет включенных ссылок для парсинга")
 
         with state.lock:
             storage_state = state.auth_storage_state
         if storage_state is None:
             raise RuntimeError("Сессия авторизации недоступна. Выполни вход заново.")
 
-        start_parser_thread(cfg, parse_url, storage_state)
+        start_parser_thread(cfg, storage_state)
+        with state.lock:
+            state.info = f"Парсер запущен. Активных ссылок: {len(enabled_sources)}"
     except Exception as exc:  # noqa: BLE001
         with state.lock:
             state.error = f"Не удалось запустить парсер: {exc}"
+
+    return redirect(url_for("index"))
+
+
+@app.post("/add-parser-source")
+def add_parser_source_route():
+    with state.lock:
+        state.error = ""
+        state.info = ""
+
+    source_url = request.form.get("source_url", "").strip()
+
+    try:
+        with state.lock:
+            is_ready = state.step == "ready" and state.auth_storage_state is not None
+
+        if not is_ready:
+            raise RuntimeError("Сначала выполни вход и подтверди код")
+
+        is_added, source = add_parser_source(source_url)
+
+        with state.lock:
+            if is_added:
+                state.info = f"Ссылка добавлена: {source.url}"
+            else:
+                state.info = f"Ссылка уже существует: {source.url}"
+    except Exception as exc:  # noqa: BLE001
+        with state.lock:
+            state.error = f"Не удалось добавить ссылку: {exc}"
+
+    return redirect(url_for("index"))
+
+
+@app.post("/toggle-parser-source")
+def toggle_parser_source_route():
+    with state.lock:
+        state.error = ""
+        state.info = ""
+
+    source_id = request.form.get("source_id", "").strip()
+    if not source_id:
+        with state.lock:
+            state.error = "Не передан идентификатор ссылки"
+        return redirect(url_for("index"))
+
+    try:
+        with state.lock:
+            is_ready = state.step == "ready" and state.auth_storage_state is not None
+
+        if not is_ready:
+            raise RuntimeError("Сначала выполни вход и подтверди код")
+
+        source = toggle_parser_source(source_id)
+        status_label = "включена" if source.enabled else "выключена"
+        with state.lock:
+            state.info = f"Ссылка {status_label}: {source.url}"
+    except Exception as exc:  # noqa: BLE001
+        with state.lock:
+            state.error = f"Не удалось изменить статус ссылки: {exc}"
+
+    return redirect(url_for("index"))
+
+
+@app.post("/delete-parser-source")
+def delete_parser_source_route():
+    with state.lock:
+        state.error = ""
+        state.info = ""
+
+    source_id = request.form.get("source_id", "").strip()
+    if not source_id:
+        with state.lock:
+            state.error = "Не передан идентификатор ссылки"
+        return redirect(url_for("index"))
+
+    try:
+        with state.lock:
+            is_ready = state.step == "ready" and state.auth_storage_state is not None
+
+        if not is_ready:
+            raise RuntimeError("Сначала выполни вход и подтверди код")
+
+        removed_source = remove_parser_source(source_id)
+        with state.lock:
+            state.info = f"Ссылка удалена: {removed_source.url}"
+    except Exception as exc:  # noqa: BLE001
+        with state.lock:
+            state.error = f"Не удалось удалить ссылку: {exc}"
+
+    return redirect(url_for("index"))
+
+
+@app.post("/update-parser-interval")
+def update_parser_interval():
+    with state.lock:
+        state.error = ""
+        state.info = ""
+
+    interval_raw = request.form.get("parser_interval_seconds", "").strip()
+
+    try:
+        with state.lock:
+            is_ready = state.step == "ready" and state.auth_storage_state is not None
+
+        if not is_ready:
+            raise RuntimeError("Сначала выполни вход и подтверди код")
+
+        interval_seconds = parse_interval_seconds(interval_raw)
+
+        upsert_env_value("PARSER_INTERVAL_SECONDS", str(interval_seconds))
+        os.environ["PARSER_INTERVAL_SECONDS"] = str(interval_seconds)
+
+        with state.lock:
+            state.parser_interval_seconds = interval_seconds
+            state.parser_interval_initialized = True
+            if state.parser_running:
+                state.info = (
+                    f"Интервал обновлен: {interval_seconds} сек. "
+                    "Применится в следующем цикле."
+                )
+            else:
+                state.info = f"Интервал обновлен: {interval_seconds} сек"
+    except Exception as exc:  # noqa: BLE001
+        with state.lock:
+            state.error = f"Не удалось обновить интервал: {exc}"
 
     return redirect(url_for("index"))
 
